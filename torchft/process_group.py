@@ -41,7 +41,7 @@ from torch.distributed import (
     get_rank,
     init_device_mesh,
 )
-from torch.distributed.distributed_c10d import Work, _world
+from torch.distributed.distributed_c10d import AllgatherOptions, Work, _world
 from torch.futures import Future
 
 if TYPE_CHECKING:
@@ -142,6 +142,7 @@ class ProcessGroup(BaseProcessGroup):
     def broadcast_one(self, tensor: torch.Tensor, root: int) -> Work:
         opts = BroadcastOptions()
         opts.rootRank = root
+        opts.asyncOp = False
         return self.broadcast([tensor], opts)
 
     def size(self) -> int:
@@ -580,10 +581,14 @@ class ProcessGroupBaby(ProcessGroup):
 
     WORK_CLASS: Type[_BabyWork] = _BabyWork
 
-    def __init__(self, timeout: Union[float, timedelta] = 60.0) -> None:
+    def __init__(self, timeout: Union[float, timedelta] = 60.0, rank: int = None, world_size: int = None) -> None:
         super().__init__(0, 1)
 
-        self._world_size = -1
+        # rank and world_size are initiliazed only once
+        self._rank = rank
+        self._world_size = world_size
+        self._active_rank = rank
+        self._active_world_size = world_size
 
         self._p: Optional[mp.Process] = None
         self._tx: Optional[mp.Queue] = None
@@ -597,13 +602,26 @@ class ProcessGroupBaby(ProcessGroup):
             timeout = timeout.total_seconds()
 
         self._timeout: float = timeout
+        self._store_addr = ""
 
-    def configure(self, store_addr: str, rank: int, world_size: int) -> None:
+    def configure(self, store_addr: str, active_rank: int, active_world_size: int) -> None:
+        self._store_addr = store_addr
+
+        # reconfigure active_rank and treat active_rank as default if default rank is not initialized
+        assert active_rank is not None
+        self._active_rank = active_rank
+        self._rank = active_rank if self._rank is None else self._rank
+
+        # reconfigure active_world_size and treat active_world_size as default if default world_size is not initialized
+        assert active_world_size is not None
+        self._active_world_size = active_world_size
+        self._world_size = active_world_size if self._world_size is None else self._world_size
+
+        print(f"configuring pg with store_addr={store_addr}, rank={self._rank}, world_size={self._world_size}, active_rank={self._active_rank}, active_world_size={self._active_world_size}")
+
+        print(f"rank {self._rank} is stopping current subprocess, store_addr={store_addr}")
         if self._p is not None:
             self._p.kill()
-
-        self._world_size = world_size
-
         if self._tx is not None:
             self._tx.close()
         if self._rx is not None:
@@ -616,6 +634,12 @@ class ProcessGroupBaby(ProcessGroup):
         if self._future_queue is not None:
             self._future_queue.close()
 
+        # myself is not participating in the process group, just return
+        if self._active_rank == -1:
+            print(f"rank {self._rank} quited the process group, store_addr={store_addr}")
+            return
+
+        print(f"rank {self._rank} is creating new subprocess, store_addr={store_addr}")
         ctx = mp.get_context("spawn")
         self._tx = ctx.Queue()
         self._rx = rx = ctx.Queue()
@@ -634,7 +658,7 @@ class ProcessGroupBaby(ProcessGroup):
 
         self._p = ctx.Process(
             target=self._worker,
-            args=(store_addr, rank, world_size, self._tx, self._rx, self._future_queue),
+            args=(store_addr, self._active_rank, self._active_world_size, self._tx, self._rx, self._future_queue),
             daemon=True,
         )
         self._p.start()
@@ -685,6 +709,7 @@ class ProcessGroupBaby(ProcessGroup):
                     next_op_id += 1
                 elif cmd == "wait":
                     op_id: int = op[1]
+                    print(f"rank {rank} wait for op_id {op_id}")
                     work[op_id].wait()
                     del work[op_id]
                     tx.put(op_id)
@@ -726,6 +751,7 @@ class ProcessGroupBaby(ProcessGroup):
         try:
             while True:
                 cmd = future_queue.get()
+                print(f"rank {self._rank} future_handler got cmd {cmd}")
                 if cmd == _QUEUE_CLOSE:
                     break
                 op_id, mode, data = cmd
@@ -739,7 +765,7 @@ class ProcessGroupBaby(ProcessGroup):
                 else:
                     raise ValueError(f"unknown mode {mode}")
         except Exception as e:
-            logger.exception(f"got unexpected error in future handler: {e}")
+            logger.exception(f"rank {self._rank} got unexpected error in future handler: {e}")
 
     def _get_future(self, op_id: int) -> Future[object]:
         with self._futures_lock:
@@ -777,6 +803,36 @@ class ProcessGroupBaby(ProcessGroup):
 
         return self._run_func("allreduce", tensors, opts)
 
+    def allgather(self, output_tensors: List[torch.Tensor], input_tensor: torch.Tensor) -> Work:
+        for tensor in output_tensors:
+            if not tensor.is_shared():
+                tensor.share_memory_()
+        if not input_tensor.is_shared():
+            input_tensor.share_memory_()
+
+        return self._run_func("allgather", output_tensors, input_tensor)
+
+    def _allgather_base(self, output: torch.Tensor, input: torch.Tensor) -> Work:
+        if not output.is_shared():
+            output.share_memory_()
+        if not input.is_shared():
+            input.share_memory_()
+
+        splitted_tensors = output.split(input.numel())
+
+        return self._run_func("allgather", splitted_tensors, input)
+
+
+    def reduce_scatter(self, output_tensors: torch.Tensor, input_tensor: list[torch.Tensor]) -> Work:
+        for tensor in input_tensor:
+            if not tensor.is_shared():
+                tensor.share_memory_()
+        if not output_tensors.is_shared():
+            output_tensors.share_memory_()
+
+        return self._run_func("reduce_scatter", output_tensors, input_tensor)
+
+
     def size(self) -> int:
         return self._world_size
 
@@ -797,6 +853,101 @@ class ProcessGroupBabyGloo(ProcessGroupBaby):
     def getBackendName(self) -> str:
         return "torchft-baby-gloo"
 
+
+class FaultTolerantProcessGroupBabyGloo(ProcessGroupBabyGloo):
+
+    def __init__(self, timeout = 60.0) -> None:
+        super().__init__(timeout)
+        self._error_ranks = []
+
+    def set_errror_ranks(self, ranks) -> None:
+        self._error_ranks = ranks
+
+    def reconfigure(self, store_addr) -> None:
+        active_world_size =  self._world_size - len(self._error_ranks)
+
+        active_ranks = []
+        for rank in range(self._world_size):
+            if rank not in self._error_ranks:
+                active_ranks.append(rank)
+
+        my_active_rank = -1
+        for i, rank in enumerate(active_ranks):
+            if rank == self._rank:
+                my_active_rank = i
+                break
+
+        self.configure(store_addr,
+                       active_rank=my_active_rank, active_world_size=active_world_size)
+
+    def _allgather_base_0(self, output: torch.Tensor, input: torch.Tensor) -> Work:
+        if not self._error_ranks:
+            return super()._allgather_base(output, input)
+
+        if self._rank in self._error_ranks:
+            return _DummyWork(output)
+
+        input_tensor_size = input.numel()
+        new_output = torch.zeros((self._world_size - len(self._error_ranks)) * input_tensor_size)
+
+        # reconfigure based on error ranks information and do allgather with new world size
+        self.reconfigure()
+        work = super()._allgather_base(new_output, input)
+
+        class _RemappingWork(Work):
+            def __init__(self, work):
+                super().__init__()
+                self._work = work
+
+            def wait(self):
+                # wait for the original work to finish
+                self._work.wait()
+
+                # remapping new_output to output
+                new_rank = 0
+                for rank in range(self._world_size):
+                    if rank in self._error_ranks:
+                        continue
+                    output[rank * input_tensor_size : (rank+1) * input_tensor_size] = new_output[new_rank: (new_rank+1) * input_tensor_size]
+                    new_rank += 1
+
+            def get_future(self):
+                return self._work.get_future()
+
+            def is_completed(self):
+                return self._work.is_completed()
+
+            def is_success(self):
+                return self._work.is_success()
+
+            def get_result(self):
+                return self._work.get_result()
+
+        return _RemappingWork(work)
+
+    def _allgather_base(self, output: torch.Tensor, input: torch.Tensor) -> Work:
+        if not self._error_ranks:
+            return super()._allgather_base(output, input)
+
+        # reconfigure process group based on error ranks
+        # note: the error ranks need to call this as well to kill subprocess and clean up internal state
+        # self.reconfigure()
+
+        # for error ranks, return dummy work for testing purposes
+        if self._rank in self._error_ranks:
+            return _DummyWork(output)
+
+        # create a view of original output tensor with new world size
+        splitted_tensors = output.split(input.numel())
+        print(f"rank {self._rank} allgather with splitted_tensors {splitted_tensors}")
+        filtered_tensors = []
+        for i, tensor in enumerate(splitted_tensors):
+            if i not in self._error_ranks:
+                filtered_tensors.append(tensor)
+
+        print(f"rank {self._rank} allgather with filtered_tensors {filtered_tensors}")
+
+        return super().allgather(filtered_tensors, input)
 
 class ProcessGroupBabyNCCL(ProcessGroupBaby):
     """

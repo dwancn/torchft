@@ -38,6 +38,7 @@ from torchft.process_group import (
     ManagedProcessGroup,
     ProcessGroup,
     ProcessGroupBabyGloo,
+    FaultTolerantProcessGroupBabyGloo,
     ProcessGroupBabyNCCL,
     ProcessGroupDummy,
     ProcessGroupGloo,
@@ -208,6 +209,183 @@ class ProcessGroupTest(TestCase):
         with self.assertRaisesRegex(TimeoutError, "timed out after 0.01 seconds"):
             a.configure(store_addr, 0, 2)
 
+    def test_gloo_all_gather_base(self) -> None:
+        print()
+
+        store1 = TCPStore(
+            host_name="localhost", port=0, is_master=True, wait_for_workers=False
+        )
+        store1_addr = f"localhost:{store1.port}/prefix"
+        print(store1_addr)
+
+        world_size = 3
+        input_tensor_size = 2
+
+        input_tensors = [torch.tensor([float(w * input_tensor_size + i + 1) for i in range(input_tensor_size)]) for w in range(world_size)]
+        output_tensors = [torch.zeros(input_tensor_size * world_size) for _ in range(world_size)]
+
+        print("input_tensors:")
+        for input_tensor in input_tensors:
+            print(input_tensor)
+
+        print("output_tensors before allgather:")
+        for output_tensor in output_tensors:
+            print(output_tensor)
+
+        def run(rank: int) -> Work:
+            pg = ProcessGroupBabyGloo()
+            pg.configure(store1_addr, rank, world_size)
+            return pg._allgather_base(output_tensors[rank], input_tensors[rank])
+
+        futs=[]
+        with ThreadPoolExecutor(max_workers=world_size) as executor:
+            for i in range(world_size):
+                futs.append(executor.submit(run, i))
+
+        for fut in futs:
+            fut.result().wait()
+
+        print("output_tensors after allgather:")
+        for output_tensor in output_tensors:
+            print(output_tensor)
+
+
+    def test_gloo_all_gather(self) -> None:
+        print()
+
+        store1 = TCPStore(
+            host_name="localhost", port=0, is_master=True, wait_for_workers=False
+        )
+        store1_addr = f"localhost:{store1.port}/prefix"
+        print(store1_addr)
+
+        world_size = 3
+        input_tensor_size = 2
+
+        pgs = [ProcessGroupBabyGloo() for _ in range(world_size)]
+        for i in range(world_size):
+            pgs[i].configure(store1_addr, i, world_size)
+
+        input_tensors = [torch.tensor([float(w * input_tensor_size + i + 1) for i in range(input_tensor_size)]) for w in range(world_size)]
+        output_tensors = [[torch.zeros(input_tensor_size) for _ in range(world_size) ]for _ in range(world_size)]
+
+        print("input_tensors:")
+        for input_tensor in input_tensors:
+            print(input_tensor)
+
+        print("output_tensors before allgather:")
+        for output_tensor in output_tensors:
+            print(output_tensor)
+
+        works = [pgs[i].allgather(output_tensors[i], input_tensors[i]) for i in range(world_size)]
+        for work in works:
+            work.wait()
+
+        print("output_tensors after allgather:")
+        for output_tensor in output_tensors:
+            print(output_tensor)
+
+    def test_ft_gloo_all_gather_base(self) -> None:
+        print()
+
+        store1 = TCPStore(
+            host_name="localhost", port=0, is_master=True, wait_for_workers=False
+        )
+        store_addr1 = f"localhost:{store1.port}/prefix1"
+        print(store_addr1)
+
+        world_size = 5
+        input_tensor_size = 2
+
+        pgs = [FaultTolerantProcessGroupBabyGloo() for _ in range(world_size)]
+        for i in range(world_size):
+            pgs[i].configure(store_addr1, i, world_size)
+
+        input_tensors = [torch.tensor([float(w * input_tensor_size + i + 1) for i in range(input_tensor_size)]) for w in range(world_size)]
+        output_tensors = [torch.zeros(input_tensor_size * world_size) for _ in range(world_size)]
+
+        print("input_tensors:")
+        for input_tensor in input_tensors:
+            print(input_tensor)
+
+        print("output_tensors before allgather:")
+        for output_tensor in output_tensors:
+            print(output_tensor)
+
+        # all_gather before errors
+        works = [pgs[i]._allgather_base(output_tensors[i], input_tensors[i]) for i in range(world_size)]
+        for work in works:
+            work.wait()
+
+        print("output_tensors after allgather before errors:")
+        for output_tensor in output_tensors:
+            print(output_tensor)
+
+        # resetting output_tensors
+        output_tensors = [torch.zeros(input_tensor_size * world_size) for _ in range(world_size)]
+
+        # setting error ranks
+        for i in range(world_size):
+            pgs[i].set_errror_ranks([1, 3])
+
+        # generate new store address
+        store_addr2 = f"localhost:{store1.port}/prefix2"
+
+        for i in range(world_size):
+            pgs[i].reconfigure(store_addr2)
+
+        # all_gather after errors
+        works = [pgs[i]._allgather_base(output_tensors[i], input_tensors[i]) for i in range(world_size)]
+        for work in works:
+            work.wait()
+
+        print("output_tensors after allgather and errors:")
+        for output_tensor in output_tensors:
+            print(output_tensor)
+
+
+    def test_gloo_with_two_ranks(self) -> None:
+        print()
+
+        store1 = TCPStore(
+            host_name="localhost", port=0, is_master=True, wait_for_workers=False
+        )
+        store1_addr = f"localhost:{store1.port}/prefix"
+        print(store1_addr)
+
+        world_size = 2
+
+        a = ProcessGroupBabyGloo()
+        b = ProcessGroupBabyGloo()
+
+        a.configure(store1_addr, 0, 2)
+        b.configure(store1_addr, 1, 2)
+
+        store1_client = TCPStore(host_name="localhost", port=store1.port, is_master=False)
+        store1_client.set("foo", "bar")
+        print(store1_client.num_keys())
+
+        self.assertEqual(a.size(), 2)
+
+        at = torch.tensor([1, 2])
+        ag = [torch.zeros_like(at) for _ in range(world_size)]
+
+        bt = torch.tensor([3, 4])
+        bg = [torch.zeros_like(bt) for _ in range(world_size)]
+
+        a_work = a.allgather(ag, at)
+        b_work = b.allgather(bg, bt)
+
+        a_work.wait()
+        fut_b = b_work.get_future()
+
+        fut_b.wait()
+
+        print()
+        print(ag)
+        print(bg)
+
+
     def test_dummy(self) -> None:
         pg = ProcessGroupDummy(0, 1)
         m = nn.Linear(3, 4)
@@ -279,6 +457,8 @@ class ProcessGroupTest(TestCase):
 
         pg = ProcessGroupGloo().register("test_func_col")
         pg.configure(store_addr, 0, 1)
+
+        print(pg.group_name)
 
         self.assertEqual(pg.group_name, str(dist.get_pg_count() - 1))
 
