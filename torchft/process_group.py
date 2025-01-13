@@ -610,7 +610,10 @@ class ProcessGroupBaby(ProcessGroup):
             self._rx.close()
         if self._future_queue is not None:
             self._future_queue.put(_QUEUE_CLOSE)
-            assert self._future_queue is not None
+        # wait for the future thread to exit and then close the queue
+        if self._future_thread is not None:
+            self._future_thread.join()
+        if self._future_queue is not None:
             self._future_queue.close()
 
         ctx = mp.get_context("spawn")
